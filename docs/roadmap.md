@@ -6,13 +6,13 @@
 - [x] Create monorepo directory structure & `.gitignore`
 - [x] Define formal JSON IPC contract (`docs/schemas/engine-ipc.schema.json`)
 - [x] Define REST & WebSocket API contracts (`docs/api.md`)
-- [ ] Commit Phase 1 baseline to Git
+- [x] Commit Phase 1 baseline to Git
 
-## Phase 2 — C++17 Core Simulation Engine
-- Implement modular CMake build (`engine/CMakeLists.txt`) with `nlohmann/json` & `GoogleTest`.
-- Implement modules: `ProcessManager`, `ResourceManager`, `DeadlockDetector`, `BankersAlgorithm`, `RecoveryManager`, `CPUScheduler`, `SyncLab`, `SimulationEngine`, `SimulationSerializer`.
-- Implement CLI `--json-stdio` & `--health` entrypoint.
-- Write & pass GoogleTest suite covering Mandatory Tests 1–8 + edge cases.
+## Phase 2 — C++17 Core Simulation Engine (Complete)
+- [x] Implement modular CMake build (`engine/CMakeLists.txt`) with `nlohmann/json` & `GoogleTest`.
+- [x] Implement modules: `ProcessManager`, `ResourceManager`, `DeadlockDetector`, `BankersAlgorithm`, `RecoveryManager`, `CPUScheduler`, `SyncLab`, `SimulationEngine`, `SimulationSerializer`.
+- [x] Implement CLI `--json-stdio` & `--health` entrypoint.
+- [x] Write & pass GoogleTest suite covering Mandatory Tests 1–8 + edge cases (18/18 passing).
 
 ## Phase 3 — FastAPI Backend Orchestration
 - Set up Python 3.11+ FastAPI app, Pydantic v2 schemas, `EngineBridge` subprocess runner with timeouts, `SessionManager`, auto-tick loop, WebSocket hub, and export service.
