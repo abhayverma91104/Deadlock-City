@@ -1,0 +1,189 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://deadlock-city.local/schemas/engine-ipc.schema.json",
+  "title": "DeadlockCityEngineIPC",
+  "description": "JSON input/output contract between FastAPI backend and C++17 deadlock_engine executable.",
+  "type": "object",
+  "$defs": {
+    "ProcessState": {
+      "type": "string",
+      "enum": ["NEW", "READY", "RUNNING", "WAITING", "BLOCKED", "TERMINATED"]
+    },
+    "ResourceStatus": {
+      "type": "string",
+      "enum": ["AVAILABLE", "ALLOCATED", "REQUESTED", "UNAVAILABLE"]
+    },
+    "SafetyStatus": {
+      "type": "string",
+      "enum": ["SAFE", "UNSAFE", "DEADLOCKED"]
+    },
+    "CityPosition": {
+      "type": "object",
+      "required": ["x", "y", "z", "plot_id"],
+      "properties": {
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "z": { "type": "number" },
+        "plot_id": { "type": "string" }
+      }
+    },
+    "Process": {
+      "type": "object",
+      "required": [
+        "id", "name", "arrival_time", "burst_time", "remaining_time",
+        "priority", "state", "max_demand", "allocated", "need",
+        "pending_request", "city_position", "termination_cost"
+      ],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "arrival_time": { "type": "integer", "minimum": 0 },
+        "burst_time": { "type": "integer", "minimum": 1 },
+        "remaining_time": { "type": "integer", "minimum": 0 },
+        "priority": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "state": { "$ref": "#/$defs/ProcessState" },
+        "max_demand": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+        "allocated": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+        "need": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+        "pending_request": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+        "city_position": { "$ref": "#/$defs/CityPosition" },
+        "termination_cost": { "type": "integer", "minimum": 1 },
+        "waiting_ticks": { "type": "integer", "minimum": 0 },
+        "preemption_count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "ResourceType": {
+      "type": "object",
+      "required": [
+        "id", "name", "category", "total_instances",
+        "available_instances", "allocated_instances", "preemptible",
+        "status", "city_position"
+      ],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "category": { "type": "string", "enum": ["IO", "LOCK", "COMPUTE", "MEMORY", "STORAGE"] },
+        "total_instances": { "type": "integer", "minimum": 1 },
+        "available_instances": { "type": "integer", "minimum": 0 },
+        "allocated_instances": { "type": "integer", "minimum": 0 },
+        "preemptible": { "type": "boolean" },
+        "status": { "$ref": "#/$defs/ResourceStatus" },
+        "city_position": { "$ref": "#/$defs/CityPosition" }
+      }
+    },
+    "DetectionStep": {
+      "type": "object",
+      "required": ["step_index", "work_before", "work_after", "selected_process", "note"],
+      "properties": {
+        "step_index": { "type": "integer" },
+        "work_before": { "type": "object", "additionalProperties": { "type": "integer" } },
+        "work_after": { "type": "object", "additionalProperties": { "type": "integer" } },
+        "selected_process": { "type": ["string", "null"] },
+        "finish_snapshot": { "type": "object", "additionalProperties": { "type": "boolean" } },
+        "note": { "type": "string" }
+      }
+    },
+    "DeadlockReport": {
+      "type": "object",
+      "required": ["detected", "deadlocked_processes", "involved_resources", "cycles", "steps", "explanation"],
+      "properties": {
+        "detected": { "type": "boolean" },
+        "has_cycle_in_rag": { "type": "boolean" },
+        "deadlocked_processes": { "type": "array", "items": { "type": "string" } },
+        "involved_resources": { "type": "array", "items": { "type": "string" } },
+        "cycles": { "type": "array", "items": { "type": "array", "items": { "type": "string" } } },
+        "wait_for_edges": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["from", "to", "resource_id"],
+            "properties": {
+              "from": { "type": "string" },
+              "to": { "type": "string" },
+              "resource_id": { "type": "string" }
+            }
+          }
+        },
+        "steps": { "type": "array", "items": { "$ref": "#/$defs/DetectionStep" } },
+        "explanation": { "type": "string" }
+      }
+    },
+    "BankerReport": {
+      "type": "object",
+      "required": ["is_safe", "safe_sequence", "steps", "explanation"],
+      "properties": {
+        "is_safe": { "type": "boolean" },
+        "safe_sequence": { "type": "array", "items": { "type": "string" } },
+        "steps": { "type": "array", "items": { "$ref": "#/$defs/DetectionStep" } },
+        "explanation": { "type": "string" }
+      }
+    },
+    "SimulationEvent": {
+      "type": "object",
+      "required": ["id", "tick", "type", "severity", "message"],
+      "properties": {
+        "id": { "type": "string" },
+        "tick": { "type": "integer" },
+        "type": {
+          "type": "string",
+          "enum": ["INFO", "ALLOCATION", "REQUEST", "RELEASE", "REJECTION", "DEADLOCK", "RECOVERY", "PROCESS", "RESOURCE"]
+        },
+        "severity": { "type": "string", "enum": ["info", "success", "warning", "error"] },
+        "message": { "type": "string" },
+        "metadata": { "type": "object" }
+      }
+    },
+    "SimulationState": {
+      "type": "object",
+      "required": [
+        "tick", "seed", "preset", "status", "safety_status",
+        "processes", "resources", "deadlock_report", "banker_report",
+        "deadlock_count", "recovery_count", "preemption_count",
+        "events", "metrics_history"
+      ],
+      "properties": {
+        "tick": { "type": "integer", "minimum": 0 },
+        "seed": { "type": "integer" },
+        "preset": { "type": ["string", "null"] },
+        "status": { "type": "string", "enum": ["IDLE", "RUNNING", "PAUSED"] },
+        "safety_status": { "$ref": "#/$defs/SafetyStatus" },
+        "processes": { "type": "array", "items": { "$ref": "#/$defs/Process" } },
+        "resources": { "type": "array", "items": { "$ref": "#/$defs/ResourceType" } },
+        "deadlock_report": { "$ref": "#/$defs/DeadlockReport" },
+        "banker_report": { "$ref": "#/$defs/BankerReport" },
+        "deadlock_count": { "type": "integer", "minimum": 0 },
+        "recovery_count": { "type": "integer", "minimum": 0 },
+        "preemption_count": { "type": "integer", "minimum": 0 },
+        "events": { "type": "array", "items": { "$ref": "#/$defs/SimulationEvent" } },
+        "metrics_history": { "type": "array", "items": { "type": "object" } },
+        "checkpoints": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "EngineRequest": {
+      "type": "object",
+      "required": ["command"],
+      "properties": {
+        "command": { "type": "string" },
+        "state": { "oneOf": [{ "$ref": "#/$defs/SimulationState" }, { "type": "null" }] },
+        "payload": { "type": "object" }
+      }
+    },
+    "EngineResponse": {
+      "type": "object",
+      "required": ["ok", "command"],
+      "properties": {
+        "ok": { "type": "boolean" },
+        "command": { "type": "string" },
+        "error": {
+          "type": ["object", "null"],
+          "properties": {
+            "code": { "type": "string" },
+            "message": { "type": "string" }
+          }
+        },
+        "state": { "oneOf": [{ "$ref": "#/$defs/SimulationState" }, { "type": "null" }] },
+        "result": { "type": ["object", "null"] }
+      }
+    }
+  }
+}
