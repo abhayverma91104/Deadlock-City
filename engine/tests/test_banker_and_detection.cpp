@@ -153,3 +153,48 @@ TEST(DeadlockDetectorTest, UnsafeStateWithoutDeadlock) {
     EXPECT_FALSE(d_report.detected);
     EXPECT_TRUE(d_report.deadlocked_processes.empty());
 }
+
+TEST(BankersAlgorithmTest, ZeroResourcesEmptyProcessesAndCumulativePendingNeedCheck) {
+    BankersAlgorithm banker;
+    // Empty workload is trivially safe
+    auto empty_rep = banker.check_safety({}, {});
+    EXPECT_TRUE(empty_rep.is_safe);
+    EXPECT_TRUE(empty_rep.safe_sequence.empty());
+
+    // Zero-resource workload with active processes: Need is zero vector <= Work -> safe
+    ResourceManager empty_rm;
+    ProcessManager zero_pm;
+    zero_pm.add_process("CPUOnly", 0, 2, 1, {}, empty_rm.resources(), 1, "P0");
+    auto zero_res_rep = banker.check_safety(zero_pm.processes(), empty_rm.resources());
+    EXPECT_TRUE(zero_res_rep.is_safe);
+    EXPECT_EQ(zero_res_rep.safe_sequence, (std::vector<std::string>{"P0"}));
+
+    // Cumulative pending + new request exceeding remaining Need must reject
+    ResourceManager rm;
+    rm.add_resource("GPU", ResourceCategory::COMPUTE, 2, false, "R0");
+    ProcessManager pm;
+    make_proc_with_alloc(pm, rm, "P0", {{"R0", 2}}, {{"R0", 0}}, {{"R0", 1}});
+    auto over_pending = banker.evaluate_request(pm.processes(), rm.resources(), "P0", {{"R0", 2}}, true);
+    EXPECT_FALSE(over_pending.approved);
+    EXPECT_EQ(over_pending.error_code, "REQUEST_EXCEEDS_NEED");
+}
+
+TEST(DeadlockDetectorTest, OverlappingCyclesAndZeroHoldZeroPendingEdgeCases) {
+    ResourceManager rm;
+    rm.add_resource("R0", ResourceCategory::LOCK, 1, false, "R0");
+    rm.add_resource("R1", ResourceCategory::LOCK, 1, false, "R1");
+
+    ProcessManager pm;
+    // Overlapping cycles from P0: P0 <-> R0 AND P0 -> R1 -> P1 -> R0 -> P0; plus P2 holds nothing with pending req, P3 holds R? none & zero pending
+    make_proc_with_alloc(pm, rm, "P0", {{"R0", 1}, {"R1", 1}}, {{"R0", 1}}, {{"R0", 1}, {"R1", 1}});
+    make_proc_with_alloc(pm, rm, "P1", {{"R0", 1}, {"R1", 1}}, {{"R1", 1}}, {{"R0", 1}});
+    make_proc_with_alloc(pm, rm, "P2", {{"R0", 1}}, {}, {{"R0", 1}}); // holds 0, pending 1 -> NOT deadlocked (finish=true)
+    make_proc_with_alloc(pm, rm, "P3", {{"R1", 1}}, {}, {});          // holds 0, pending 0 -> NOT deadlocked
+
+    DeadlockDetector detector;
+    auto report = detector.detect(pm.processes(), rm.resources());
+    EXPECT_TRUE(report.detected);
+    EXPECT_TRUE(report.has_cycle_in_rag);
+    EXPECT_GE(report.cycles.size(), 2u);
+    EXPECT_EQ(report.deadlocked_processes, (std::vector<std::string>{"P0", "P1"}));
+}

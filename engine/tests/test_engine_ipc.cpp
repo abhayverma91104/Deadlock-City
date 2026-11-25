@@ -102,3 +102,81 @@ TEST(SimulationEngineIPCTest, EndToEndDeadlockRecoveryAndLabsViaJSON) {
     EXPECT_TRUE(sync["result"]["completed_cleanly"].get<bool>());
     EXPECT_EQ(sync["result"]["overflows"].get<int>(), 0);
 }
+
+TEST(SimulationEngineIPCTest, Phase7PresetCatalogMetricsAndRollback) {
+    SimulationEngine engine;
+    auto catalog = engine.execute_command({
+        {"command", "list_presets"},
+        {"payload", nlohmann::json::object()}
+    });
+    ASSERT_TRUE(catalog["ok"].get<bool>());
+    ASSERT_EQ(catalog["result"]["presets"].size(), 9u);
+
+    for (const auto& entry : catalog["result"]["presets"]) {
+        const std::string pid = entry.at("id").get<std::string>();
+        auto loaded = engine.execute_command({
+            {"command", "load_preset"},
+            {"payload", {{"preset", pid}, {"seed", entry.at("default_seed").get<unsigned int>()}}}
+        });
+        ASSERT_TRUE(loaded["ok"].get<bool>()) << pid;
+        ASSERT_FALSE(loaded["state"]["metrics_history"].empty()) << pid;
+        EXPECT_TRUE(loaded["state"]["metrics_history"][0].contains("available_count")) << pid;
+        EXPECT_TRUE(loaded["state"]["metrics_history"][0].contains("safety_status")) << pid;
+    }
+
+    // Exercise granted + rejected request counters and process completion counters
+    auto safe_sim = engine.execute_command({
+        {"command", "load_preset"},
+        {"payload", {{"preset", "classic_banker_safe"}, {"seed", 42}}}
+    });
+    ASSERT_TRUE(safe_sim["ok"].get<bool>());
+
+    auto bad_req = engine.execute_command({
+        {"command", "request_resources"},
+        {"state", safe_sim["state"]},
+        {"payload", {{"process_id", "P0"}, {"request", {{"R0", 99}}}, {"use_banker", true}}}
+    });
+    ASSERT_FALSE(bad_req["ok"].get<bool>());
+    EXPECT_EQ(bad_req["state"]["rejected_request_count"].get<int>(), 1);
+
+    auto good_req = engine.execute_command({
+        {"command", "request_resources"},
+        {"state", bad_req["state"]},
+        {"payload", {{"process_id", "P1"}, {"request", {{"R0", 1}, {"R2", 2}}}, {"use_banker", true}}}
+    });
+    ASSERT_TRUE(good_req["ok"].get<bool>());
+    EXPECT_EQ(good_req["state"]["granted_request_count"].get<int>(), 1);
+
+    // Step until completion happens (P1 has remaining_time = 4, P3 has 3, priority picks P3 or P1)
+    auto st = good_req["state"];
+    for (int i = 0; i < 6; ++i) {
+        auto step = engine.execute_command({{"command", "step_simulation"}, {"state", st}, {"payload", nlohmann::json::object()}});
+        ASSERT_TRUE(step["ok"].get<bool>());
+        st = step["state"];
+    }
+    EXPECT_GE(st["completed_count"].get<int>(), 1);
+
+    // Recovery termination + checkpoint rollback preserves recovery_count and restores tick/history
+    auto rec_sim = engine.execute_command({
+        {"command", "load_preset"},
+        {"payload", {{"preset", "recovery_demo"}, {"seed", 42}}}
+    });
+    ASSERT_TRUE(rec_sim["ok"].get<bool>());
+    auto term = engine.execute_command({
+        {"command", "recover_deadlock"},
+        {"state", rec_sim["state"]},
+        {"payload", {{"strategy", "terminate_victim"}, {"victim_criteria", "lowest_cost"}}}
+    });
+    ASSERT_TRUE(term["ok"].get<bool>());
+    EXPECT_EQ(term["state"]["recovery_terminated_count"].get<int>(), 1);
+
+    auto rb = engine.execute_command({
+        {"command", "recover_deadlock"},
+        {"state", rec_sim["state"]},
+        {"payload", {{"strategy", "rollback"}, {"checkpoint_index", 0}}}
+    });
+    ASSERT_TRUE(rb["ok"].get<bool>());
+    EXPECT_EQ(rb["state"]["tick"].get<int>(), 0);
+    EXPECT_EQ(rb["state"]["recovery_count"].get<int>(), 1);
+    EXPECT_FALSE(rb["state"]["deadlock_report"]["detected"].get<bool>());
+}

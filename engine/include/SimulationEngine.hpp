@@ -19,6 +19,7 @@ public:
     SimulationEngine() = default;
 
     nlohmann::json execute_command(const nlohmann::json& request);
+    static nlohmann::json preset_catalog();
 
     SimulationState create_simulation(unsigned int seed = 42, const std::optional<std::string>& preset = std::nullopt);
     SimulationState load_preset(const std::string& preset_name, unsigned int seed = 42);

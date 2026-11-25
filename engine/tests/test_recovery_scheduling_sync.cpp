@@ -147,6 +147,26 @@ TEST(CPUSchedulerTest, VerifiedGanttAndMetrics) {
     EXPECT_EQ(rr.total_time, 9);
 }
 
+TEST(CPUSchedulerTest, IdleGapsSimultaneousArrivalsAndTieBreaking) {
+    CPUScheduler scheduler;
+    // Idle gap [0..2], simultaneous arrival at t=2 (P1, P2), another idle gap [7..9]
+    std::vector<ScheduleInputProcess> procs = {
+        {"P2", "SecondID", 2, 2, 2},
+        {"P1", "FirstID", 2, 3, 2},
+        {"P3", "Late", 9, 2, 1}
+    };
+
+    // FCFS tie-breaks simultaneous arrival by alphabetical ID -> P1[2..5], P2[5..7], idle[7..9], P3[9..11]
+    auto fcfs = scheduler.run(SchedulingAlgorithm::FCFS, procs, 2);
+    EXPECT_EQ(fcfs.total_time, 11);
+    ASSERT_EQ(fcfs.gantt.size(), 3u);
+    EXPECT_EQ(fcfs.gantt[0].process_id, "P1");
+    EXPECT_EQ(fcfs.gantt[0].start_time, 2);
+    EXPECT_EQ(fcfs.gantt[2].start_time, 9);
+    // Busy time = 3 + 2 + 2 = 7 out of 11 -> ~63.636%
+    EXPECT_NEAR(fcfs.cpu_utilization_pct, (7.0 / 11.0) * 100.0, 1e-3);
+}
+
 // MANDATORY TEST 8: Bounded Synchronization Lab (Safe vs Unsafe)
 TEST(SyncLabTest, ProducerConsumerSafeHasNoOverflowOrUnderflow) {
     SyncLab lab;
@@ -176,6 +196,8 @@ TEST(SyncLabTest, DiningPhilosophersSafeCompletesAllMeals) {
     EXPECT_TRUE(report.completed_cleanly);
     EXPECT_EQ(report.completed_meals, 20);
     EXPECT_EQ(report.conflicts, 0);
+    ASSERT_FALSE(report.events.empty());
+    EXPECT_EQ(report.events.front().fork_owners.size(), 5u);
 }
 
 TEST(SyncLabTest, ReadersWritersSafeHasZeroConflicts) {
@@ -206,4 +228,76 @@ TEST(SyncLabTest, UnsafeModesTerminateBoundedlyAndReportAnomalies) {
     dp.iterations = 2;
     auto dp_rep = lab.run(dp);
     EXPECT_FALSE(dp_rep.completed_cleanly);
+}
+
+TEST(RecoveryManagerTest, RefusesSuccessWhenDeadlockRemainsUnresolvedAcrossDisjointCycles) {
+    SimulationState state;
+    ResourceManager rm;
+    rm.add_resource("R0", ResourceCategory::LOCK, 1, false, "R0");
+    rm.add_resource("R1", ResourceCategory::LOCK, 1, false, "R1");
+    rm.add_resource("R2", ResourceCategory::LOCK, 1, false, "R2");
+    rm.add_resource("R3", ResourceCategory::LOCK, 1, false, "R3");
+
+    ProcessManager pm;
+    pm.add_process("Cycle1A", 0, 4, 2, {{"R0", 1}, {"R1", 1}}, rm.resources(), 1, "P0");
+    pm.add_process("Cycle1B", 0, 4, 2, {{"R0", 1}, {"R1", 1}}, rm.resources(), 5, "P1");
+    pm.add_process("Cycle2A", 0, 4, 2, {{"R2", 1}, {"R3", 1}}, rm.resources(), 3, "P2");
+    pm.add_process("Cycle2B", 0, 4, 2, {{"R2", 1}, {"R3", 1}}, rm.resources(), 6, "P3");
+
+    std::string err;
+    for (const auto& rid : {"R0", "R1", "R2", "R3"}) ASSERT_TRUE(rm.allocate(rid, 1, err));
+    pm.find_mut("P0")->allocated["R0"] = 1; pm.find_mut("P0")->pending_request["R1"] = 1; pm.find_mut("P0")->state = ProcessState::BLOCKED;
+    pm.find_mut("P1")->allocated["R1"] = 1; pm.find_mut("P1")->pending_request["R0"] = 1; pm.find_mut("P1")->state = ProcessState::BLOCKED;
+    pm.find_mut("P2")->allocated["R2"] = 1; pm.find_mut("P2")->pending_request["R3"] = 1; pm.find_mut("P2")->state = ProcessState::BLOCKED;
+    pm.find_mut("P3")->allocated["R3"] = 1; pm.find_mut("P3")->pending_request["R2"] = 1; pm.find_mut("P3")->state = ProcessState::BLOCKED;
+
+    DeadlockDetector detector;
+    BankersAlgorithm banker;
+    RecoveryManager recovery;
+
+    // Single-victim termination resolves Cycle 1 only -> Cycle 2 remains deadlocked -> MUST NOT report ok=true
+    RecoveryRequest victim_req;
+    victim_req.strategy = RecoveryStrategy::TERMINATE_VICTIM;
+    victim_req.victim_criteria = VictimCriteria::LOWEST_COST;
+    auto partial = recovery.recover(state, pm, rm, detector, banker, victim_req);
+    EXPECT_FALSE(partial.ok);
+    EXPECT_EQ(partial.error_code, "DEADLOCK_UNRESOLVED");
+    EXPECT_TRUE(state.deadlock_report.detected);
+
+    // TERMINATE_ALL clears remaining deadlock cleanly and conserves all resource units
+    RecoveryRequest all_req;
+    all_req.strategy = RecoveryStrategy::TERMINATE_ALL;
+    auto full = recovery.recover(state, pm, rm, detector, banker, all_req);
+    EXPECT_TRUE(full.ok) << full.message;
+    EXPECT_FALSE(state.deadlock_report.detected);
+    for (const auto& r : rm.resources()) {
+        EXPECT_EQ(r.available_instances + r.allocated_instances, r.total_instances);
+    }
+}
+
+TEST(CPUSchedulerTest, InvalidInputsSingleProcessAndEqualPriorityTieBreak) {
+    CPUScheduler scheduler;
+    EXPECT_THROW(scheduler.run(SchedulingAlgorithm::FCFS, {}, 2), std::invalid_argument);
+    EXPECT_THROW(
+        scheduler.run(SchedulingAlgorithm::RR, {{"P0", "Solo", 0, 3, 1}}, 0),
+        std::invalid_argument
+    );
+
+    auto solo = scheduler.run(SchedulingAlgorithm::SRTF, {{"P0", "Solo", 3, 4, 1}}, 2);
+    EXPECT_EQ(solo.total_time, 7);
+    EXPECT_EQ(solo.context_switches, 0);
+    ASSERT_EQ(solo.process_metrics.size(), 1u);
+    EXPECT_EQ(solo.process_metrics[0].waiting_time, 0);
+    EXPECT_EQ(solo.process_metrics[0].response_time, 0);
+    EXPECT_EQ(solo.process_metrics[0].turnaround_time, 4);
+
+    // Equal priorities at arrival 0 tie-break deterministically by sorted id (P1 before P2)
+    auto prio = scheduler.run(
+        SchedulingAlgorithm::PRIORITY,
+        {{"P2", "B", 0, 2, 3}, {"P1", "A", 0, 2, 3}},
+        2
+    );
+    ASSERT_EQ(prio.gantt.size(), 2u);
+    EXPECT_EQ(prio.gantt[0].process_id, "P1");
+    EXPECT_EQ(prio.gantt[1].process_id, "P2");
 }

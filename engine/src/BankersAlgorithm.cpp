@@ -157,12 +157,12 @@ RequestEvaluation BankersAlgorithm::evaluate_request(
         return eval;
     }
 
-    // Validate request keys and positive total
-    int total_requested = 0;
+    // Validate request keys, bounds against integer overflow, and positive total
+    long long total_requested = 0;
     for (const auto& [rid, qty] : request) {
-        if (qty < 0) {
+        if (qty < 0 || qty > 1000000) {
             eval.error_code = "INVALID_REQUEST";
-            eval.reason = "Negative request quantity for resource " + rid;
+            eval.reason = "Invalid request quantity for resource " + rid;
             return eval;
         }
         bool known = false;
@@ -185,16 +185,18 @@ RequestEvaluation BankersAlgorithm::evaluate_request(
         return eval;
     }
 
-    // Step 1: Verify Request <= Need
+    // Step 1: Verify Request + PendingRequest <= Need
     for (const auto& r : resources) {
         const int req_qty = get_val(request, r.id);
+        const int pending_qty = get_val(target->pending_request, r.id);
         const int max_qty = get_val(target->max_demand, r.id);
         const int alloc_qty = get_val(target->allocated, r.id);
         const int need_qty = std::max(0, max_qty - alloc_qty);
-        if (req_qty > need_qty) {
+        if (req_qty + pending_qty > need_qty) {
             eval.error_code = "REQUEST_EXCEEDS_NEED";
             eval.reason = "Process " + process_id + " requested " + std::to_string(req_qty) +
-                          " units of " + r.id + ", exceeding remaining Need (" +
+                          " units of " + r.id + " (plus " + std::to_string(pending_qty) +
+                          " pending), exceeding remaining Need (" +
                           std::to_string(need_qty) + ").";
             eval.banker_report = check_safety(processes, resources);
             return eval;

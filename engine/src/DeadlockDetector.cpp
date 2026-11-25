@@ -42,38 +42,44 @@ void find_rag_cycles(
     std::vector<std::vector<std::string>>& out_cycles
 ) {
     constexpr std::size_t kMaxCycles = 32;
+    constexpr std::size_t kMaxExpansions = 10000;
     std::set<std::vector<std::string>> unique_cycles;
-    std::set<std::string> visited_global;
+    std::size_t expansions = 0;
 
     auto strip_prefix = [](const std::string& node) {
         return node.size() > 2 ? node.substr(2) : node;
     };
 
-    for (const auto& [start_node, _] : adj) {
+    // Johnson-style canonical start-node search: only traverse nodes >= start_node so
+    // secondary overlapping cycles are never skipped by a global visited set.
+    for (const auto& entry : adj) {
+        const std::string& start_node = entry.first;
+        if (unique_cycles.size() >= kMaxCycles || expansions >= kMaxExpansions) break;
+
         std::vector<std::string> path;
         std::set<std::string> on_stack;
 
         auto dfs = [&](auto& self, const std::string& u) -> void {
-            if (unique_cycles.size() >= kMaxCycles) return;
+            if (unique_cycles.size() >= kMaxCycles || expansions >= kMaxExpansions) return;
+            expansions++;
             path.push_back(u);
             on_stack.insert(u);
 
             auto it = adj.find(u);
             if (it != adj.end()) {
                 for (const auto& v : it->second) {
-                    if (on_stack.count(v)) {
-                        auto pos = std::find(path.begin(), path.end(), v);
-                        if (pos != path.end()) {
-                            std::vector<std::string> raw;
-                            for (auto iter = pos; iter != path.end(); ++iter) {
-                                raw.push_back(strip_prefix(*iter));
-                            }
-                            auto canon = canonicalize_cycle(raw);
-                            if (unique_cycles.insert(canon).second) {
-                                out_cycles.push_back(std::move(canon));
-                            }
+                    if (v < start_node) continue;
+                    if (v == start_node) {
+                        std::vector<std::string> raw;
+                        raw.reserve(path.size());
+                        for (const auto& node : path) {
+                            raw.push_back(strip_prefix(node));
                         }
-                    } else if (!visited_global.count(v)) {
+                        auto canon = canonicalize_cycle(raw);
+                        if (unique_cycles.insert(canon).second) {
+                            out_cycles.push_back(std::move(canon));
+                        }
+                    } else if (!on_stack.count(v)) {
                         self(self, v);
                     }
                 }
@@ -81,12 +87,9 @@ void find_rag_cycles(
 
             on_stack.erase(u);
             path.pop_back();
-            visited_global.insert(u);
         };
 
-        if (!visited_global.count(start_node)) {
-            dfs(dfs, start_node);
-        }
+        dfs(dfs, start_node);
     }
 }
 

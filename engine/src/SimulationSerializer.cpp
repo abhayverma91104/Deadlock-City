@@ -233,7 +233,15 @@ nlohmann::json SimulationSerializer::to_json(const MetricPoint& m) {
         {"active_count", m.active_count},
         {"blocked_count", m.blocked_count},
         {"deadlocked_count", m.deadlocked_count},
-        {"allocation_count", m.allocation_count}
+        {"allocation_count", m.allocation_count},
+        {"available_count", m.available_count},
+        {"waiting_count", m.waiting_count},
+        {"completed_count", m.completed_count},
+        {"terminated_count", m.terminated_count},
+        {"pending_request_units", m.pending_request_units},
+        {"deadlock_count", m.deadlock_count},
+        {"recovery_count", m.recovery_count},
+        {"safety_status", to_string(m.safety_status)}
     };
 }
 
@@ -245,6 +253,14 @@ MetricPoint SimulationSerializer::metric_from_json(const nlohmann::json& j) {
     m.blocked_count = j.value("blocked_count", 0);
     m.deadlocked_count = j.value("deadlocked_count", 0);
     m.allocation_count = j.value("allocation_count", 0);
+    m.available_count = j.value("available_count", 0);
+    m.waiting_count = j.value("waiting_count", 0);
+    m.completed_count = j.value("completed_count", 0);
+    m.terminated_count = j.value("terminated_count", 0);
+    m.pending_request_units = j.value("pending_request_units", 0);
+    m.deadlock_count = j.value("deadlock_count", 0);
+    m.recovery_count = j.value("recovery_count", 0);
+    m.safety_status = safety_status_from_string(j.value("safety_status", std::string("SAFE")));
     return m;
 }
 
@@ -270,7 +286,13 @@ nlohmann::json SimulationSerializer::snapshot_to_json(const SimulationStateSnaps
         {"banker_report", to_json(s.banker_report)},
         {"deadlock_count", s.deadlock_count},
         {"recovery_count", s.recovery_count},
+        {"recovery_terminated_count", s.recovery_terminated_count},
         {"preemption_count", s.preemption_count},
+        {"completed_count", s.completed_count},
+        {"granted_request_count", s.granted_request_count},
+        {"rejected_request_count", s.rejected_request_count},
+        {"total_metric_samples_recorded", s.total_metric_samples_recorded},
+        {"total_events_recorded", s.total_events_recorded},
         {"events", evs},
         {"metrics_history", mets}
     };
@@ -300,7 +322,13 @@ SimulationStateSnapshot SimulationSerializer::snapshot_from_json(const nlohmann:
     }
     s.deadlock_count = j.value("deadlock_count", 0);
     s.recovery_count = j.value("recovery_count", 0);
+    s.recovery_terminated_count = j.value("recovery_terminated_count", 0);
     s.preemption_count = j.value("preemption_count", 0);
+    s.completed_count = j.value("completed_count", 0);
+    s.granted_request_count = j.value("granted_request_count", 0);
+    s.rejected_request_count = j.value("rejected_request_count", 0);
+    s.total_metric_samples_recorded = j.value("total_metric_samples_recorded", 0);
+    s.total_events_recorded = j.value("total_events_recorded", 0);
     if (j.contains("events") && j["events"].is_array()) {
         for (const auto& e : j["events"]) s.events.push_back(event_from_json(e));
     }
@@ -383,14 +411,26 @@ nlohmann::json SimulationSerializer::to_json(const ScheduleResult& s) {
 nlohmann::json SimulationSerializer::to_json(const SyncReport& r) {
     nlohmann::json events = nlohmann::json::array();
     for (const auto& e : r.events) {
-        events.push_back({
+        nlohmann::json ev = {
             {"seq", e.seq},
             {"thread_id", e.thread_id},
             {"state", e.state},
             {"action", e.action},
             {"resource", e.resource},
             {"detail", e.detail}
-        });
+        };
+        if (e.buffer_occupancy >= 0 || e.buffer_capacity > 0) {
+            ev["buffer_occupancy"] = e.buffer_occupancy;
+            ev["buffer_capacity"] = e.buffer_capacity;
+        }
+        if (r.scenario == SyncScenario::READERS_WRITERS) {
+            ev["active_readers"] = e.active_readers;
+            ev["active_writers"] = e.active_writers;
+        }
+        if (!e.fork_owners.empty()) {
+            ev["fork_owners"] = e.fork_owners;
+        }
+        events.push_back(std::move(ev));
     }
     return {
         {"scenario", to_string(r.scenario)},

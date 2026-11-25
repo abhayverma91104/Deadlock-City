@@ -126,7 +126,7 @@
         "tick": { "type": "integer" },
         "type": {
           "type": "string",
-          "enum": ["INFO", "ALLOCATION", "REQUEST", "RELEASE", "REJECTION", "DEADLOCK", "RECOVERY", "PROCESS", "RESOURCE"]
+          "enum": ["INFO", "ALLOCATION", "REQUEST", "RELEASE", "REJECTION", "DEADLOCK", "SAFETY_CHANGE", "RECOVERY", "CHECKPOINT", "ROLLBACK", "PROCESS", "RESOURCE"]
         },
         "severity": { "type": "string", "enum": ["info", "success", "warning", "error"] },
         "message": { "type": "string" },
@@ -153,9 +153,36 @@
         "banker_report": { "$ref": "#/$defs/BankerReport" },
         "deadlock_count": { "type": "integer", "minimum": 0 },
         "recovery_count": { "type": "integer", "minimum": 0 },
+        "recovery_terminated_count": { "type": "integer", "minimum": 0 },
         "preemption_count": { "type": "integer", "minimum": 0 },
+        "completed_count": { "type": "integer", "minimum": 0 },
+        "granted_request_count": { "type": "integer", "minimum": 0 },
+        "rejected_request_count": { "type": "integer", "minimum": 0 },
+        "total_metric_samples_recorded": { "type": "integer", "minimum": 0 },
+        "total_events_recorded": { "type": "integer", "minimum": 0 },
         "events": { "type": "array", "items": { "$ref": "#/$defs/SimulationEvent" } },
-        "metrics_history": { "type": "array", "items": { "type": "object" } },
+        "metrics_history": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "tick": { "type": "integer" },
+              "utilization_pct": { "type": "number" },
+              "active_count": { "type": "integer" },
+              "blocked_count": { "type": "integer" },
+              "deadlocked_count": { "type": "integer" },
+              "allocation_count": { "type": "integer" },
+              "available_count": { "type": "integer" },
+              "waiting_count": { "type": "integer" },
+              "completed_count": { "type": "integer" },
+              "terminated_count": { "type": "integer" },
+              "pending_request_units": { "type": "integer" },
+              "deadlock_count": { "type": "integer" },
+              "recovery_count": { "type": "integer" },
+              "safety_status": { "$ref": "#/$defs/SafetyStatus" }
+            }
+          }
+        },
         "checkpoints": { "type": "array", "items": { "type": "object" } }
       }
     },

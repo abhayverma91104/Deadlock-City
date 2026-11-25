@@ -166,6 +166,14 @@ struct MetricPoint {
     int blocked_count{0};
     int deadlocked_count{0};
     int allocation_count{0};
+    int available_count{0};
+    int waiting_count{0};
+    int completed_count{0};
+    int terminated_count{0};
+    int pending_request_units{0};
+    int deadlock_count{0};
+    int recovery_count{0};
+    SafetyStatus safety_status{SafetyStatus::SAFE};
 };
 
 struct EngineError {
@@ -185,7 +193,13 @@ struct SimulationStateSnapshot {
     BankerReport banker_report;
     int deadlock_count{0};
     int recovery_count{0};
+    int recovery_terminated_count{0};
     int preemption_count{0};
+    int completed_count{0};
+    int granted_request_count{0};
+    int rejected_request_count{0};
+    int total_metric_samples_recorded{0};
+    int total_events_recorded{0};
     std::vector<SimulationEvent> events;
     std::vector<MetricPoint> metrics_history;
 };

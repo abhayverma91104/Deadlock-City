@@ -1,6 +1,7 @@
 #include "SyncLab.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cctype>
@@ -57,14 +58,31 @@ void record_event(
     const std::string& state,
     const std::string& action,
     const std::string& resource,
-    const std::string& detail
+    const std::string& detail,
+    int buffer_occupancy = -1,
+    int buffer_capacity = 0,
+    int active_readers = 0,
+    int active_writers = 0,
+    std::vector<int> fork_owners = {}
 ) {
     std::lock_guard<std::mutex> lock(log_mtx);
     const int s = seq.fetch_add(1);
-    if (events.size() < 200) {
-        events.push_back(SyncEvent{s, tid, state, action, resource, detail});
+    if (events.size() < 240) {
+        SyncEvent ev;
+        ev.seq = s;
+        ev.thread_id = tid;
+        ev.state = state;
+        ev.action = action;
+        ev.resource = resource;
+        ev.detail = detail;
+        ev.buffer_occupancy = buffer_occupancy;
+        ev.buffer_capacity = buffer_capacity;
+        ev.active_readers = active_readers;
+        ev.active_writers = active_writers;
+        ev.fork_owners = std::move(fork_owners);
+        events.push_back(std::move(ev));
     }
-    if (logs.size() < 200) {
+    if (logs.size() < 240) {
         logs.push_back("[" + tid + "] " + action + " (" + resource + "): " + detail);
     }
 }
@@ -84,7 +102,6 @@ SyncReport run_producer_consumer(const SyncRequest& req) {
     std::condition_variable not_full;
     std::condition_variable not_empty;
     std::vector<int> buffer;
-    int logical_count = 0;
 
     std::mutex log_mtx;
     std::atomic<int> seq{0};
@@ -100,6 +117,12 @@ SyncReport run_producer_consumer(const SyncRequest& req) {
                 const std::string tid = "Producer-" + std::to_string(p + 1);
                 for (int i = 0; i < items_per_producer; ++i) {
                     std::unique_lock<std::mutex> lock(buf_mtx);
+                    if (static_cast<int>(buffer.size()) >= capacity) {
+                        record_event(report.events, report.logs, log_mtx, seq, tid, "WAITING",
+                                     "WAIT_NOT_FULL", "Buffer",
+                                     "Buffer full (" + std::to_string(buffer.size()) + "/" + std::to_string(capacity) + "); waiting on CV.",
+                                     static_cast<int>(buffer.size()), capacity);
+                    }
                     if (!not_full.wait_for(lock, std::chrono::milliseconds(500), [&]() {
                             return static_cast<int>(buffer.size()) < capacity;
                         })) {
@@ -107,11 +130,12 @@ SyncReport run_producer_consumer(const SyncRequest& req) {
                     }
                     buffer.push_back(p * 100 + i);
                     produced.fetch_add(1);
-                    const auto occ = buffer.size();
+                    const int occ = static_cast<int>(buffer.size());
                     lock.unlock();
                     not_empty.notify_one();
                     record_event(report.events, report.logs, log_mtx, seq, tid, "RUNNING",
-                                 "PRODUCE", "Buffer", "Item queued; occupancy " + std::to_string(occ) + "/" + std::to_string(capacity));
+                                 "PRODUCE", "Buffer", "Item queued; occupancy " + std::to_string(occ) + "/" + std::to_string(capacity),
+                                 occ, capacity);
                 }
             });
         }
@@ -121,6 +145,12 @@ SyncReport run_producer_consumer(const SyncRequest& req) {
                 const std::string tid = "Consumer-" + std::to_string(c + 1);
                 for (int i = 0; i < items_per_producer; ++i) {
                     std::unique_lock<std::mutex> lock(buf_mtx);
+                    if (buffer.empty()) {
+                        record_event(report.events, report.logs, log_mtx, seq, tid, "WAITING",
+                                     "WAIT_NOT_EMPTY", "Buffer",
+                                     "Buffer empty (0/" + std::to_string(capacity) + "); waiting on CV.",
+                                     0, capacity);
+                    }
                     if (!not_empty.wait_for(lock, std::chrono::milliseconds(500), [&]() {
                             return !buffer.empty();
                         })) {
@@ -128,11 +158,12 @@ SyncReport run_producer_consumer(const SyncRequest& req) {
                     }
                     buffer.pop_back();
                     consumed.fetch_add(1);
-                    const auto occ = buffer.size();
+                    const int occ = static_cast<int>(buffer.size());
                     lock.unlock();
                     not_full.notify_one();
                     record_event(report.events, report.logs, log_mtx, seq, tid, "RUNNING",
-                                 "CONSUME", "Buffer", "Item consumed; occupancy " + std::to_string(occ) + "/" + std::to_string(capacity));
+                                 "CONSUME", "Buffer", "Item consumed; occupancy " + std::to_string(occ) + "/" + std::to_string(capacity),
+                                 occ, capacity);
                 }
             });
         }
@@ -159,15 +190,18 @@ SyncReport run_producer_consumer(const SyncRequest& req) {
                     std::this_thread::sleep_for(std::chrono::microseconds(150));
                     int next = observed + 1;
                     unsync_count.store(next, std::memory_order_relaxed);
-                    logical_count = next;
                     produced.fetch_add(1);
                     if (next > capacity) {
                         overflows.fetch_add(1);
                         record_event(report.events, report.logs, log_mtx, seq, tid, "RACE",
-                                     "OVERFLOW", "Buffer", "Unsafe write exceeded capacity (" + std::to_string(next) + "/" + std::to_string(capacity) + ")");
+                                     "OVERFLOW", "Buffer",
+                                     "Unsafe write exceeded capacity (" + std::to_string(next) + "/" + std::to_string(capacity) + ")",
+                                     next, capacity);
                     } else {
                         record_event(report.events, report.logs, log_mtx, seq, tid, "RUNNING",
-                                     "UNSAFE_PRODUCE", "Buffer", "Unsynchronized write; count=" + std::to_string(next));
+                                     "UNSAFE_PRODUCE", "Buffer",
+                                     "Unsynchronized write; count=" + std::to_string(next),
+                                     next, capacity);
                     }
                 }
             });
@@ -184,17 +218,20 @@ SyncReport run_producer_consumer(const SyncRequest& req) {
                     if (next < 0) {
                         underflows.fetch_add(1);
                         record_event(report.events, report.logs, log_mtx, seq, tid, "RACE",
-                                     "UNDERFLOW", "Buffer", "Unsafe read on empty buffer (count=" + std::to_string(next) + ")");
+                                     "UNDERFLOW", "Buffer",
+                                     "Unsafe read on empty buffer (count=" + std::to_string(next) + ")",
+                                     next, capacity);
                     } else {
                         record_event(report.events, report.logs, log_mtx, seq, tid, "RUNNING",
-                                     "UNSAFE_CONSUME", "Buffer", "Unsynchronized read; count=" + std::to_string(next));
+                                     "UNSAFE_CONSUME", "Buffer",
+                                     "Unsynchronized read; count=" + std::to_string(next),
+                                     next, capacity);
                     }
                 }
             });
         }
         for (auto& t : threads) t.join();
 
-        (void)logical_count;
         report.produced_count = produced.load();
         report.consumed_count = consumed.load();
         report.overflows = overflows.load();
@@ -235,23 +272,40 @@ SyncReport run_readers_writers(const SyncRequest& req) {
             threads.emplace_back([&, r]() {
                 const std::string tid = "Reader-" + std::to_string(r + 1);
                 for (int i = 0; i < iters; ++i) {
+                    int snap_r = 0;
+                    int snap_w = 0;
                     {
                         std::unique_lock<std::mutex> lock(rw_mtx);
-                        rw_cv.wait_for(lock, std::chrono::milliseconds(300), [&]() {
-                            return active_writers == 0;
-                        });
+                        if (active_writers > 0) {
+                            record_event(report.events, report.logs, log_mtx, seq, tid, "WAITING",
+                                         "WAIT_READ", "SharedStore", "Waiting for active writer to finish.",
+                                         -1, 0, active_readers, active_writers);
+                        }
+                        if (!rw_cv.wait_for(lock, std::chrono::milliseconds(500), [&]() {
+                                return active_writers == 0;
+                            })) {
+                            return;
+                        }
                         active_readers++;
+                        snap_r = active_readers;
+                        snap_w = active_writers;
                     }
                     if (atomic_writers.load() > 0) conflicts.fetch_add(1);
                     const int val = shared_data;
-                    std::this_thread::sleep_for(std::chrono::microseconds(80));
                     record_event(report.events, report.logs, log_mtx, seq, tid, "RUNNING",
-                                 "READ", "SharedStore", "Read value=" + std::to_string(val));
+                                 "READ", "SharedStore", "Read value=" + std::to_string(val),
+                                 -1, 0, snap_r, snap_w);
+                    std::this_thread::sleep_for(std::chrono::microseconds(80));
                     {
                         std::lock_guard<std::mutex> lock(rw_mtx);
                         active_readers--;
+                        snap_r = active_readers;
+                        snap_w = active_writers;
                         if (active_readers == 0) rw_cv.notify_all();
                     }
+                    record_event(report.events, report.logs, log_mtx, seq, tid, "IDLE",
+                                 "READ_RELEASE", "SharedStore", "Reader released shared lock.",
+                                 -1, 0, snap_r, snap_w);
                 }
             });
         }
@@ -260,20 +314,33 @@ SyncReport run_readers_writers(const SyncRequest& req) {
                 const std::string tid = "Writer-" + std::to_string(w + 1);
                 for (int i = 0; i < iters; ++i) {
                     std::unique_lock<std::mutex> lock(rw_mtx);
-                    rw_cv.wait_for(lock, std::chrono::milliseconds(300), [&]() {
-                        return active_readers == 0 && active_writers == 0;
-                    });
+                    if (active_readers > 0 || active_writers > 0) {
+                        record_event(report.events, report.logs, log_mtx, seq, tid, "WAITING",
+                                     "WAIT_WRITE", "SharedStore", "Waiting for exclusive writer access.",
+                                     -1, 0, active_readers, active_writers);
+                    }
+                    if (!rw_cv.wait_for(lock, std::chrono::milliseconds(500), [&]() {
+                            return active_readers == 0 && active_writers == 0;
+                        })) {
+                        return;
+                    }
                     active_writers++;
                     atomic_writers.fetch_add(1);
                     shared_data += 1;
                     const int val = shared_data;
+                    record_event(report.events, report.logs, log_mtx, seq, tid, "RUNNING",
+                                 "WRITE", "SharedStore", "Updated value=" + std::to_string(val),
+                                 -1, 0, active_readers, active_writers);
                     std::this_thread::sleep_for(std::chrono::microseconds(100));
                     atomic_writers.fetch_sub(1);
                     active_writers--;
+                    const int snap_r = active_readers;
+                    const int snap_w = active_writers;
                     rw_cv.notify_all();
                     lock.unlock();
-                    record_event(report.events, report.logs, log_mtx, seq, tid, "RUNNING",
-                                 "WRITE", "SharedStore", "Updated value=" + std::to_string(val));
+                    record_event(report.events, report.logs, log_mtx, seq, tid, "IDLE",
+                                 "WRITE_RELEASE", "SharedStore", "Writer released exclusive lock.",
+                                 -1, 0, snap_r, snap_w);
                 }
             });
         }
@@ -287,11 +354,17 @@ SyncReport run_readers_writers(const SyncRequest& req) {
             threads.emplace_back([&, r]() {
                 const std::string tid = "Reader-" + std::to_string(r + 1);
                 for (int i = 0; i < iters; ++i) {
-                    atomic_readers.fetch_add(1);
-                    if (atomic_writers.load() > 0) {
+                    const int ar = atomic_readers.fetch_add(1) + 1;
+                    const int aw = atomic_writers.load();
+                    if (aw > 0) {
                         conflicts.fetch_add(1);
                         record_event(report.events, report.logs, log_mtx, seq, tid, "RACE",
-                                     "RW_CONFLICT", "SharedStore", "Reader entered critical section while writer active!");
+                                     "RW_CONFLICT", "SharedStore", "Reader entered critical section while writer active!",
+                                     -1, 0, ar, aw);
+                    } else {
+                        record_event(report.events, report.logs, log_mtx, seq, tid, "RUNNING",
+                                     "UNSAFE_READ", "SharedStore", "Unprotected read.",
+                                     -1, 0, ar, aw);
                     }
                     std::this_thread::sleep_for(std::chrono::microseconds(120));
                     atomic_readers.fetch_sub(1);
@@ -302,11 +375,17 @@ SyncReport run_readers_writers(const SyncRequest& req) {
             threads.emplace_back([&, w]() {
                 const std::string tid = "Writer-" + std::to_string(w + 1);
                 for (int i = 0; i < iters; ++i) {
-                    atomic_writers.fetch_add(1);
-                    if (atomic_readers.load() > 0 || atomic_writers.load() > 1) {
+                    const int aw = atomic_writers.fetch_add(1) + 1;
+                    const int ar = atomic_readers.load();
+                    if (ar > 0 || aw > 1) {
                         conflicts.fetch_add(1);
                         record_event(report.events, report.logs, log_mtx, seq, tid, "RACE",
-                                     "WRITE_CONFLICT", "SharedStore", "Concurrent write/read violation detected!");
+                                     "WRITE_CONFLICT", "SharedStore", "Concurrent write/read violation detected!",
+                                     -1, 0, ar, aw);
+                    } else {
+                        record_event(report.events, report.logs, log_mtx, seq, tid, "RUNNING",
+                                     "UNSAFE_WRITE", "SharedStore", "Unprotected write.",
+                                     -1, 0, ar, aw);
                     }
                     std::this_thread::sleep_for(std::chrono::microseconds(140));
                     atomic_writers.fetch_sub(1);
@@ -324,6 +403,47 @@ SyncReport run_readers_writers(const SyncRequest& req) {
     return report;
 }
 
+struct TimedFork {
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool in_use = false;
+
+    bool try_acquire_for(std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mtx);
+        if (!cv.wait_for(lock, timeout, [this]() { return !in_use; })) {
+            return false;
+        }
+        in_use = true;
+        return true;
+    }
+
+    void release() {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            in_use = false;
+        }
+        cv.notify_one();
+    }
+};
+
+struct TimedForkGuard {
+    TimedFork* fork = nullptr;
+    bool acquired = false;
+
+    TimedForkGuard() = default;
+    TimedForkGuard(TimedFork& f, std::chrono::milliseconds timeout)
+        : fork(&f), acquired(f.try_acquire_for(timeout)) {}
+    ~TimedForkGuard() {
+        if (acquired && fork) {
+            fork->release();
+        }
+    }
+    TimedForkGuard(const TimedForkGuard&) = delete;
+    TimedForkGuard& operator=(const TimedForkGuard&) = delete;
+
+    bool owns_lock() const { return acquired; }
+};
+
 SyncReport run_dining_philosophers(const SyncRequest& req) {
     SyncReport report;
     report.scenario = SyncScenario::DINING_PHILOSOPHERS;
@@ -331,7 +451,17 @@ SyncReport run_dining_philosophers(const SyncRequest& req) {
 
     constexpr int kCount = 5;
     const int meals_target = std::clamp(req.iterations, 1, 20);
-    std::vector<std::timed_mutex> forks(kCount);
+    std::array<TimedFork, kCount> forks;
+    std::mutex fork_state_mtx;
+    std::vector<int> fork_owners(kCount, -1);
+
+    auto snapshot_forks = [&](int fork_idx, int owner) {
+        std::lock_guard<std::mutex> lock(fork_state_mtx);
+        if (fork_idx >= 0 && fork_idx < kCount) {
+            fork_owners[static_cast<std::size_t>(fork_idx)] = owner;
+        }
+        return fork_owners;
+    };
 
     std::mutex log_mtx;
     std::atomic<int> seq{0};
@@ -346,43 +476,74 @@ SyncReport run_dining_philosophers(const SyncRequest& req) {
             const int right = (i + 1) % kCount;
 
             for (int m = 0; m < meals_target; ++m) {
+                record_event(report.events, report.logs, log_mtx, seq, tid, "HUNGRY",
+                             "HUNGRY", "Table", "Philosopher ready for meal #" + std::to_string(m + 1),
+                             -1, 0, 0, 0, snapshot_forks(-1, -1));
+
                 if (req.mode == SyncMode::SAFE) {
-                    // Resource hierarchy: always acquire lower-indexed fork first to break circular wait
                     const int first = std::min(left, right);
                     const int second = std::max(left, right);
-                    std::unique_lock<std::timed_mutex> l1(forks[first], std::chrono::milliseconds(400));
+                    TimedForkGuard l1(forks[first], std::chrono::milliseconds(400));
                     if (!l1.owns_lock()) {
                         deadlock_timeouts.fetch_add(1);
                         continue;
                     }
-                    std::unique_lock<std::timed_mutex> l2(forks[second], std::chrono::milliseconds(400));
+                    auto s1 = snapshot_forks(first, i);
+                    record_event(report.events, report.logs, log_mtx, seq, tid, "WAITING",
+                                 "FORK_ACQUIRE", "Fork-" + std::to_string(first),
+                                 "Acquired Fork-" + std::to_string(first) + "; waiting for Fork-" + std::to_string(second),
+                                 -1, 0, 0, 0, s1);
+
+                    TimedForkGuard l2(forks[second], std::chrono::milliseconds(400));
                     if (!l2.owns_lock()) {
+                        snapshot_forks(first, -1);
                         deadlock_timeouts.fetch_add(1);
                         continue;
                     }
+                    auto s2 = snapshot_forks(second, i);
                     completed_meals.fetch_add(1);
                     record_event(report.events, report.logs, log_mtx, seq, tid, "EATING",
                                  "EAT", "Fork-" + std::to_string(first) + "+Fork-" + std::to_string(second),
-                                 "Meal #" + std::to_string(m + 1) + " completed cleanly.");
+                                 "Meal #" + std::to_string(m + 1) + " completed cleanly.",
+                                 -1, 0, 0, 0, s2);
                     std::this_thread::sleep_for(std::chrono::microseconds(60));
+
+                    snapshot_forks(second, -1);
+                    auto s_rel = snapshot_forks(first, -1);
+                    record_event(report.events, report.logs, log_mtx, seq, tid, "THINKING",
+                                 "FORK_RELEASE", "Table", "Released both forks and returned to thinking.",
+                                 -1, 0, 0, 0, s_rel);
                 } else {
-                    // Unsafe circular hold-and-wait: all grab left simultaneously, then wait briefly on right
-                    std::unique_lock<std::timed_mutex> l1(forks[left], std::chrono::milliseconds(30));
+                    TimedForkGuard l1(forks[left], std::chrono::milliseconds(30));
                     if (!l1.owns_lock()) {
                         deadlock_timeouts.fetch_add(1);
                         continue;
                     }
+                    auto s1 = snapshot_forks(left, i);
+                    record_event(report.events, report.logs, log_mtx, seq, tid, "WAITING",
+                                 "FORK_ACQUIRE", "Fork-" + std::to_string(left),
+                                 "Acquired left Fork-" + std::to_string(left) + "; attempting right Fork-" + std::to_string(right),
+                                 -1, 0, 0, 0, s1);
                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                    std::unique_lock<std::timed_mutex> l2(forks[right], std::chrono::milliseconds(15));
+                    TimedForkGuard l2(forks[right], std::chrono::milliseconds(15));
                     if (!l2.owns_lock()) {
                         deadlock_timeouts.fetch_add(1);
+                        auto s_to = snapshot_forks(left, -1);
                         record_event(report.events, report.logs, log_mtx, seq, tid, "BLOCKED",
                                      "TIMEOUT", "Fork-" + std::to_string(right),
                                      "Circular wait timeout holding Fork-" + std::to_string(left) +
-                                     " while waiting for Fork-" + std::to_string(right) + ".");
+                                     " while waiting for Fork-" + std::to_string(right) + "; released left fork to avoid permanent hang.",
+                                     -1, 0, 0, 0, s_to);
                         continue;
                     }
+                    auto s2 = snapshot_forks(right, i);
                     completed_meals.fetch_add(1);
+                    record_event(report.events, report.logs, log_mtx, seq, tid, "EATING",
+                                 "EAT", "Fork-" + std::to_string(left) + "+Fork-" + std::to_string(right),
+                                 "Meal completed.",
+                                 -1, 0, 0, 0, s2);
+                    snapshot_forks(right, -1);
+                    snapshot_forks(left, -1);
                 }
             }
         });
@@ -400,7 +561,7 @@ SyncReport run_dining_philosophers(const SyncRequest& req) {
         report.race_or_deadlock_detected = (report.conflicts > 0);
         report.completed_cleanly = false;
         report.summary = "UNSAFE Dining Philosophers experienced " +
-                         std::to_string(report.conflicts) + " circular-wait deadlock timeout(s); " +
+                         std::to_string(report.conflicts) + " circular-wait timeout(s); " +
                          std::to_string(report.completed_meals) + "/" +
                          std::to_string(kCount * meals_target) + " meals completed.";
     }

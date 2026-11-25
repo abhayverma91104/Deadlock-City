@@ -8,6 +8,7 @@ Thumbs.db
 
 # C++ / CMake
 engine/build/
+engine/build-*/
 build/
 cmake-build-*/
 *.o
@@ -17,6 +18,11 @@ cmake-build-*/
 *.dylib
 *.exe
 compile_commands.json
+
+# Secrets & Environment Files
+.env
+.env.*
+!.env.example
 
 # Python / FastAPI
 backend/.venv/
@@ -30,9 +36,11 @@ htmlcov/
 *.egg-info/
 
 # Frontend / Node
+node_modules/
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
+*.tsbuildinfo
 npm-debug.log*
 yarn-debug.log*
 pnpm-debug.log*

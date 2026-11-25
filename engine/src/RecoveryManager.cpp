@@ -157,6 +157,8 @@ RecoveryResult RecoveryManager::recover(
                 }
             }
             res.unblocked_processes = grant_satisfied_pending_requests(pm, rm);
+            state.granted_request_count += static_cast<int>(res.unblocked_processes.size());
+            state.recovery_terminated_count += static_cast<int>(res.terminated_processes.size());
             state.recovery_count += 1;
             sync_state_vectors(state, pm, rm, detector, banker);
             res.ok = true;
@@ -207,11 +209,20 @@ RecoveryResult RecoveryManager::recover(
             res.terminated_processes.push_back(victim_id);
             merge_recovered(res.recovered_units, held);
             res.unblocked_processes = grant_satisfied_pending_requests(pm, rm);
+            state.granted_request_count += static_cast<int>(res.unblocked_processes.size());
+            state.recovery_terminated_count += static_cast<int>(res.terminated_processes.size());
             state.recovery_count += 1;
             sync_state_vectors(state, pm, rm, detector, banker);
-            res.ok = true;
-            res.message = "Terminated victim process " + victim_id +
-                          " (" + to_string(req.victim_criteria) + ") and reclaimed held resources.";
+            if (state.deadlock_report.detected) {
+                res.ok = false;
+                res.error_code = "DEADLOCK_UNRESOLVED";
+                res.message = "Terminated victim " + victim_id + ", but deadlock remains unresolved (" +
+                              state.deadlock_report.explanation + ").";
+            } else {
+                res.ok = true;
+                res.message = "Terminated victim process " + victim_id +
+                              " (" + to_string(req.victim_criteria) + ") and reclaimed held resources.";
+            }
             break;
         }
 
@@ -304,10 +315,18 @@ RecoveryResult RecoveryManager::recover(
             res.preempted_resources.push_back(rid);
             res.recovered_units[rid] = held_qty;
             res.unblocked_processes = grant_satisfied_pending_requests(pm, rm);
+            state.granted_request_count += static_cast<int>(res.unblocked_processes.size());
             sync_state_vectors(state, pm, rm, detector, banker);
-            res.ok = true;
-            res.message = "Preempted " + std::to_string(held_qty) + " unit(s) of " + rid +
-                          " from process " + victim->id + ".";
+            if (state.deadlock_report.detected) {
+                res.ok = false;
+                res.error_code = "DEADLOCK_UNRESOLVED";
+                res.message = "Preempted " + std::to_string(held_qty) + " unit(s) of " + rid +
+                              " from " + victim->id + ", but deadlock remains unresolved.";
+            } else {
+                res.ok = true;
+                res.message = "Preempted " + std::to_string(held_qty) + " unit(s) of " + rid +
+                              " from process " + victim->id + ".";
+            }
             break;
         }
 
@@ -328,20 +347,29 @@ RecoveryResult RecoveryManager::recover(
 
             const int prev_recoveries = state.recovery_count;
             const int prev_preemptions = state.preemption_count;
+            const int prev_rec_term = state.recovery_terminated_count;
             const auto restored = state.checkpoints[idx];
             state.checkpoints.resize(idx);
             static_cast<SimulationStateSnapshot&>(state) = restored;
             state.recovery_count = prev_recoveries + 1;
             state.preemption_count = std::max(prev_preemptions, state.preemption_count);
+            state.recovery_terminated_count = std::max(prev_rec_term, state.recovery_terminated_count);
 
             rm = ResourceManager(state.resources);
             pm = ProcessManager(state.processes);
             sync_state_vectors(state, pm, rm, detector, banker);
 
-            res.ok = true;
             res.restored_checkpoint_index = idx;
-            res.message = "Rolled back simulation state to checkpoint #" + std::to_string(idx) +
-                          " (tick " + std::to_string(state.tick) + ").";
+            if (state.deadlock_report.detected) {
+                res.ok = false;
+                res.error_code = "DEADLOCK_UNRESOLVED";
+                res.message = "Rolled back to checkpoint #" + std::to_string(idx) +
+                              ", but that checkpoint is still deadlocked.";
+            } else {
+                res.ok = true;
+                res.message = "Rolled back simulation state to checkpoint #" + std::to_string(idx) +
+                              " (tick " + std::to_string(state.tick) + ").";
+            }
             break;
         }
     }

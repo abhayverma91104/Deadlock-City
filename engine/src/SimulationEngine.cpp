@@ -81,8 +81,9 @@ void SimulationEngine::append_event(
     const std::string& message,
     const std::map<std::string, std::string>& meta
 ) {
+    state.total_events_recorded += 1;
     SimulationEvent ev;
-    ev.id = "ev_" + std::to_string(state.tick) + "_" + std::to_string(state.events.size() + 1);
+    ev.id = "ev_" + std::to_string(state.tick) + "_" + std::to_string(state.total_events_recorded);
     ev.tick = state.tick;
     ev.type = type;
     ev.severity = severity;
@@ -107,7 +108,9 @@ void SimulationEngine::refresh_diagnostics(
     ResourceManager& rm,
     bool record_metric
 ) {
-    const bool was_deadlocked = (state.safety_status == SafetyStatus::DEADLOCKED);
+    const SafetyStatus prev_safety = state.safety_status;
+    const bool was_deadlocked = (prev_safety == SafetyStatus::DEADLOCKED);
+    const bool initialized_yet = !state.events.empty();
     rm.refresh_statuses(pm.processes());
     state.processes = pm.processes();
     state.resources = rm.resources();
@@ -126,17 +129,43 @@ void SimulationEngine::refresh_diagnostics(
         state.safety_status = SafetyStatus::SAFE;
     }
 
+    if (initialized_yet && state.safety_status != prev_safety) {
+        append_event(
+            state,
+            "SAFETY_CHANGE",
+            state.safety_status == SafetyStatus::SAFE
+                ? "success"
+                : state.safety_status == SafetyStatus::DEADLOCKED ? "error" : "warning",
+            "System safety transitioned from " + to_string(prev_safety) + " to " + to_string(state.safety_status) + ".",
+            {{"safety_from", to_string(prev_safety)}, {"safety_to", to_string(state.safety_status)}}
+        );
+    }
+
     if (record_metric) {
         int total_inst = 0;
         int alloc_inst = 0;
+        int avail_inst = 0;
         for (const auto& r : state.resources) {
             total_inst += r.total_instances;
             alloc_inst += r.allocated_instances;
+            avail_inst += r.available_instances;
         }
         int active = 0;
         int blocked = 0;
+        int waiting = 0;
+        int terminated = 0;
+        int pending_units = 0;
         for (const auto& p : state.processes) {
-            if (p.state != ProcessState::TERMINATED) active++;
+            if (p.state != ProcessState::TERMINATED) {
+                active++;
+                for (const auto& [rid, qty] : p.pending_request) {
+                    (void)rid;
+                    if (qty > 0) pending_units += qty;
+                }
+            } else {
+                terminated++;
+            }
+            if (p.state == ProcessState::WAITING) waiting++;
             if (p.state == ProcessState::BLOCKED || p.state == ProcessState::WAITING) blocked++;
         }
         MetricPoint mp;
@@ -148,9 +177,40 @@ void SimulationEngine::refresh_diagnostics(
         mp.blocked_count = blocked;
         mp.deadlocked_count = static_cast<int>(state.deadlock_report.deadlocked_processes.size());
         mp.allocation_count = alloc_inst;
-        state.metrics_history.push_back(mp);
-        if (state.metrics_history.size() > 240) {
-            state.metrics_history.erase(state.metrics_history.begin());
+        mp.available_count = avail_inst;
+        mp.waiting_count = waiting;
+        mp.completed_count = state.completed_count;
+        mp.terminated_count = terminated;
+        mp.pending_request_units = pending_units;
+        mp.deadlock_count = state.deadlock_count;
+        mp.recovery_count = state.recovery_count;
+        mp.safety_status = state.safety_status;
+
+        bool is_duplicate_tail = false;
+        if (!state.metrics_history.empty()) {
+            const auto& last = state.metrics_history.back();
+            is_duplicate_tail =
+                last.tick == mp.tick &&
+                last.utilization_pct == mp.utilization_pct &&
+                last.active_count == mp.active_count &&
+                last.blocked_count == mp.blocked_count &&
+                last.deadlocked_count == mp.deadlocked_count &&
+                last.allocation_count == mp.allocation_count &&
+                last.available_count == mp.available_count &&
+                last.waiting_count == mp.waiting_count &&
+                last.completed_count == mp.completed_count &&
+                last.terminated_count == mp.terminated_count &&
+                last.pending_request_units == mp.pending_request_units &&
+                last.deadlock_count == mp.deadlock_count &&
+                last.recovery_count == mp.recovery_count &&
+                last.safety_status == mp.safety_status;
+        }
+        if (!is_duplicate_tail) {
+            state.total_metric_samples_recorded += 1;
+            state.metrics_history.push_back(mp);
+            if (state.metrics_history.size() > 240) {
+                state.metrics_history.erase(state.metrics_history.begin());
+            }
         }
     }
 }
@@ -411,8 +471,15 @@ void SimulationEngine::step_internal(SimulationState& state, ProcessManager& pm,
 
     // 2. Retry BLOCKED pending requests if resources became available
     auto unblocked = RecoveryManager::grant_satisfied_pending_requests(pm, rm);
+    state.granted_request_count += static_cast<int>(unblocked.size());
     for (const auto& pid : unblocked) {
-        append_event(state, "ALLOCATION", "success", "Granted pending request for unblocked process " + pid + ".");
+        append_event(
+            state,
+            "ALLOCATION",
+            "success",
+            "Granted pending request for unblocked process " + pid + ".",
+            {{"process_id", pid}}
+        );
     }
 
     // 3. Increment waiting_ticks on blocked/waiting processes
@@ -440,6 +507,13 @@ void SimulationEngine::step_internal(SimulationState& state, ProcessManager& pm,
         }
         if (runner) {
             runner->state = ProcessState::RUNNING;
+            append_event(
+                state,
+                "PROCESS",
+                "info",
+                "Dispatched process " + runner->id + " (" + runner->name + ") to RUNNING.",
+                {{"process_id", runner->id}, {"transition", "READY->RUNNING"}}
+            );
         }
     }
 
@@ -449,17 +523,153 @@ void SimulationEngine::step_internal(SimulationState& state, ProcessManager& pm,
             std::string err;
             const std::string finished_id = runner->id;
             pm.terminate_process(finished_id, rm, err);
-            append_event(state, "PROCESS", "success", "Process " + finished_id + " completed execution and released all resources.");
+            state.completed_count += 1;
+            append_event(
+                state,
+                "PROCESS",
+                "success",
+                "Process " + finished_id + " completed execution and released all resources.",
+                {{"process_id", finished_id}, {"transition", "RUNNING->COMPLETED"}}
+            );
 
             // Re-check blocked processes immediately after completion releases resources
             auto post_unblocked = RecoveryManager::grant_satisfied_pending_requests(pm, rm);
+            state.granted_request_count += static_cast<int>(post_unblocked.size());
             for (const auto& pid : post_unblocked) {
-                append_event(state, "ALLOCATION", "success", "Process " + pid + " acquired freed resources and resumed READY.");
+                append_event(
+                    state,
+                    "ALLOCATION",
+                    "success",
+                    "Process " + pid + " acquired freed resources and resumed READY.",
+                    {{"process_id", pid}}
+                );
             }
         }
     }
 
     refresh_diagnostics(state, pm, rm, true);
+}
+
+nlohmann::json SimulationEngine::preset_catalog() {
+    return nlohmann::json::array({
+        {
+            {"id", "normal_workload"},
+            {"name", "Normal Workload"},
+            {"category", "Safe"},
+            {"description", "Balanced 4-process city workload with healthy resource headroom across Compute, Memory, and Disk."},
+            {"os_concept", "Safe Multi-Process Resource Sharing"},
+            {"initial_process_count", 4},
+            {"initial_resource_config", {{"R0", 6}, {"R1", 6}, {"R2", 4}}},
+            {"expected_behavior", "Remains SAFE; all processes complete cleanly as resources recycle across ticks."},
+            {"learning_objective", "Observe normal resource allocation, process completion, and declining utilization in a healthy OS."},
+            {"recommended_actions", {"Step +1 Tick", "Run Banker Safety Check", "Inspect Utilization Charts"}},
+            {"default_seed", 42}
+        },
+        {
+            {"id", "classic_banker_safe"},
+            {"name", "Classic Banker's Safe State"},
+            {"category", "Safe"},
+            {"description", "Textbook Silberschatz 5-process (P0-P4), 3-resource (10, 5, 7) safe state verification scenario."},
+            {"os_concept", "Banker's Algorithm Safe Sequence Verification"},
+            {"initial_process_count", 5},
+            {"initial_resource_config", {{"R0", 10}, {"R1", 5}, {"R2", 7}}},
+            {"expected_behavior", "Banker's algorithm finds the canonical safe completion order P1 -> P3 -> P4 -> P0 -> P2."},
+            {"learning_objective", "Verify Need = Max - Allocation and trace Work/Finish execution step-by-step."},
+            {"recommended_actions", {"Open Banker's Lab", "Test P1 [1,0,2] Grant", "Test Unsafe Request Rejection"}},
+            {"default_seed", 42}
+        },
+        {
+            {"id", "single_instance_deadlock"},
+            {"name", "Single-Instance Deadlock"},
+            {"category", "Deadlock"},
+            {"description", "Classic P0 <-> P1 circular wait over single-unit Printer A (R0) and Database Lock B (R1)."},
+            {"os_concept", "Coffman Circular Wait with Single-Instance Resources"},
+            {"initial_process_count", 2},
+            {"initial_resource_config", {{"R0", 1}, {"R1", 1}}},
+            {"expected_behavior", "Immediate DEADLOCKED state with Wait-For cycle P0 -> P1 -> P0; auto-run halts."},
+            {"learning_objective", "Contrast single-instance RAG cycle sufficiency for deadlock against multi-instance pools."},
+            {"recommended_actions", {"Inspect RAG & WFG", "Run Detection Trace", "Compare Recovery Strategies"}},
+            {"default_seed", 42}
+        },
+        {
+            {"id", "multiple_instance_deadlock"},
+            {"name", "Multi-Instance Deadlock"},
+            {"category", "Deadlock"},
+            {"description", "Saturated 2-unit GPU Cluster and Lock Table pools where Trainer-Alpha and Trainer-Beta hold and request conflicting units."},
+            {"os_concept", "Deadlock Detection Matrix Algorithm (Multiple Instances)"},
+            {"initial_process_count", 3},
+            {"initial_resource_config", {{"R0", 2}, {"R1", 2}}},
+            {"expected_behavior", "DEADLOCKED across P0 and P1 while Monitor (P2) requires no unallocated units."},
+            {"learning_objective", "Observe Request <= Work matrix reduction when multiple resource instances exist."},
+            {"recommended_actions", {"Run Detection Matrix Trace", "Preempt GPU Cluster (R0)", "Terminate Lowest-Cost Victim"}},
+            {"default_seed", 42}
+        },
+        {
+            {"id", "multi_instance_safe_cycle"},
+            {"name", "Multi-Instance Cycle (Safe)"},
+            {"category", "Safe"},
+            {"description", "Demonstrates a Resource Allocation Graph cycle involving P0, P1, R0, and R1 that resolves without deadlock via Finisher-2 releasing R0."},
+            {"os_concept", "Cycle Necessary But Not Sufficient (Multi-Instance RAG)"},
+            {"initial_process_count", 3},
+            {"initial_resource_config", {{"R0", 2}, {"R1", 1}}},
+            {"expected_behavior", "RAG reports has_cycle_in_rag=true, yet Finisher-2 (P2) can finish and break the cycle (detected=false)."},
+            {"learning_objective", "Understand why graph cycle detection alone yields false positives on multi-instance resources."},
+            {"recommended_actions", {"Open RAG Graph", "Compare RAG vs WFG", "Step Simulation to Watch P2 Free R0"}},
+            {"default_seed", 42}
+        },
+        {
+            {"id", "unsafe_no_deadlock"},
+            {"name", "Unsafe State (No Deadlock)"},
+            {"category", "Unsafe"},
+            {"description", "Backup-A and Backup-B hold 3/4 Tape Drives and 1/2 Network Links with zero blocking, yet no safe sequence exists for worst-case Max claims."},
+            {"os_concept", "Banker's Unsafe Region vs Actual Deadlock"},
+            {"initial_process_count", 2},
+            {"initial_resource_config", {{"R0", 4}, {"R1", 2}}},
+            {"expected_behavior", "safety_status=UNSAFE, deadlock_report.detected=false; neither process is deadlocked yet."},
+            {"learning_objective", "Distinguish unsafe states (loss of deadlock avoidance guarantee) from confirmed runtime deadlock."},
+            {"recommended_actions", {"Inspect Banker's Matrix", "Run Detection Lab", "Step Simulation to Observe Execution"}},
+            {"default_seed", 42}
+        },
+        {
+            {"id", "resource_starvation"},
+            {"name", "Resource Starvation"},
+            {"category", "Contention"},
+            {"description", "Low-priority LowPrio-Batch (P2) waits indefinitely behind priority-1 Realtime holders across Priority Bus and RAM Slice."},
+            {"os_concept", "Indefinite Blocking / Priority Contention"},
+            {"initial_process_count", 3},
+            {"initial_resource_config", {{"R0", 2}, {"R1", 3}}},
+            {"expected_behavior", "P2 accumulates waiting_ticks while P0 and P1 execute first until their completion frees resources."},
+            {"learning_objective", "Measure waiting_ticks and contrast starvation with circular deadlock."},
+            {"recommended_actions", {"Monitor Avg Waiting Ticks", "Step 5+ Ticks", "Inspect Event Timeline"}},
+            {"default_seed", 42}
+        },
+        {
+            {"id", "high_contention"},
+            {"name", "High Contention"},
+            {"category", "Contention"},
+            {"description", "Near-saturated Core Pool, DB Lock, and NVMe Bus with three competing Query tasks waiting on mutually held pools."},
+            {"os_concept", "High Resource Utilization & Cascade Blocking"},
+            {"initial_process_count", 4},
+            {"initial_resource_config", {{"R0", 3}, {"R1", 2}, {"R2", 2}}},
+            {"expected_behavior", "High utilization with blocked processes relying on Query-3 completion or recovery intervention."},
+            {"learning_objective", "Observe how contention elevates utilization_pct and triggers cascading unblocking or deadlock."},
+            {"recommended_actions", {"Watch Utilization Chart", "Inspect Deadlock Status", "Test Preemption Recovery"}},
+            {"default_seed", 42}
+        },
+        {
+            {"id", "recovery_demo"},
+            {"name", "Recovery Experiment"},
+            {"category", "Deadlock"},
+            {"description", "3-process circular wait (CriticalGateway, TempWorker, AnalyticsJob) pre-loaded with a clean initial recovery checkpoint."},
+            {"os_concept", "Deadlock Recovery (Termination, Preemption, Checkpoint Rollback)"},
+            {"initial_process_count", 3},
+            {"initial_resource_config", {{"R0", 1}, {"R1", 1}, {"R2", 1}}},
+            {"expected_behavior", "DEADLOCKED at tick 0 with 1 preemptible resource (R1) and 1 clean pre-deadlock checkpoint (#0)."},
+            {"learning_objective", "Compare victim selection cost vs resource preemption vs checkpoint rollback restoration."},
+            {"recommended_actions", {"Open Recovery Center", "Create Checkpoint", "Compare All Recovery Strategies"}},
+            {"default_seed", 42}
+        }
+    });
 }
 
 nlohmann::json SimulationEngine::execute_command(const nlohmann::json& req) {
@@ -476,6 +686,19 @@ nlohmann::json SimulationEngine::execute_command(const nlohmann::json& req) {
         // Standalone commands (no SimulationState needed)
         if (cmd == "health") {
             return ok_response(cmd, std::nullopt, {{"engine_version", "1.0.0"}, {"status", "ok"}});
+        }
+
+        if (cmd == "list_presets") {
+            return ok_response(cmd, std::nullopt, {
+                {"presets", preset_catalog()},
+                {"random_workload", {
+                    {"min_processes", 2},
+                    {"max_processes", 12},
+                    {"min_resources", 2},
+                    {"max_resources", 6},
+                    {"default_seed", 42}
+                }}
+            });
         }
 
         if (cmd == "compare_scheduling") {
@@ -545,11 +768,20 @@ nlohmann::json SimulationEngine::execute_command(const nlohmann::json& req) {
 
         if (cmd == "create_checkpoint") {
             save_checkpoint(state);
-            append_event(state, "INFO", "info", "Saved recovery checkpoint at tick " + std::to_string(state.tick) + ".");
+            append_event(
+                state,
+                "CHECKPOINT",
+                "info",
+                "Saved recovery checkpoint at tick " + std::to_string(state.tick) + ".",
+                {{"checkpoint_index", std::to_string(state.checkpoints.size() - 1)}}
+            );
             return ok_response(cmd, state, {{"checkpoint_count", state.checkpoints.size()}});
         }
 
         if (cmd == "add_process") {
+            if (pm.processes().size() >= 24) {
+                return err_response(cmd, "PROCESS_LIMIT_EXCEEDED", "Maximum 24 processes per simulation session exceeded.", state);
+            }
             ResourceVector max_d;
             if (payload.contains("max_demand") && payload["max_demand"].is_object()) {
                 max_d = payload["max_demand"].get<ResourceVector>();
@@ -569,7 +801,7 @@ nlohmann::json SimulationEngine::execute_command(const nlohmann::json& req) {
                 explicit_id,
                 payload.value("arrival_time", state.tick) > state.tick ? ProcessState::NEW : ProcessState::READY
             );
-            append_event(state, "PROCESS", "info", "Created process " + proc.id + " (" + proc.name + ").");
+            append_event(state, "PROCESS", "info", "Created process " + proc.id + " (" + proc.name + ").", {{"process_id", proc.id}});
             refresh_diagnostics(state, pm, rm, true);
             return ok_response(cmd, state, {{"process", SimulationSerializer::to_json(proc)}});
         }
@@ -581,7 +813,8 @@ nlohmann::json SimulationEngine::execute_command(const nlohmann::json& req) {
                 return err_response(cmd, "PROCESS_ERROR", err, state);
             }
             auto unblocked = RecoveryManager::grant_satisfied_pending_requests(pm, rm);
-            append_event(state, "PROCESS", "info", "Terminated process " + pid + " and released held resources.");
+            state.granted_request_count += static_cast<int>(unblocked.size());
+            append_event(state, "PROCESS", "info", "Terminated process " + pid + " and released held resources.", {{"process_id", pid}});
             refresh_diagnostics(state, pm, rm, true);
             return ok_response(cmd, state, {{"terminated", pid}, {"unblocked_processes", unblocked}});
         }
@@ -592,7 +825,7 @@ nlohmann::json SimulationEngine::execute_command(const nlohmann::json& req) {
             if (!pm.suspend_process(pid, err)) {
                 return err_response(cmd, "PROCESS_ERROR", err, state);
             }
-            append_event(state, "PROCESS", "warning", "Suspended process " + pid + ".");
+            append_event(state, "PROCESS", "warning", "Suspended process " + pid + ".", {{"process_id", pid}, {"transition", "SUSPENDED"}});
             refresh_diagnostics(state, pm, rm, false);
             return ok_response(cmd, state, {{"process_id", pid}});
         }
@@ -603,12 +836,19 @@ nlohmann::json SimulationEngine::execute_command(const nlohmann::json& req) {
             if (!pm.resume_process(pid, err)) {
                 return err_response(cmd, "PROCESS_ERROR", err, state);
             }
-            append_event(state, "PROCESS", "info", "Resumed process " + pid + ".");
+            append_event(state, "PROCESS", "info", "Resumed process " + pid + ".", {{"process_id", pid}, {"transition", "RESUMED"}});
             refresh_diagnostics(state, pm, rm, false);
             return ok_response(cmd, state, {{"process_id", pid}});
         }
 
         if (cmd == "add_resource") {
+            if (rm.resources().size() >= 12) {
+                return err_response(cmd, "RESOURCE_LIMIT_EXCEEDED", "Maximum 12 resource pools per simulation session exceeded.", state);
+            }
+            const int inst_count = payload.at("total_instances").get<int>();
+            if (inst_count < 1 || inst_count > 64) {
+                return err_response(cmd, "VALIDATION_ERROR", "Resource total_instances must be between 1 and 64.", state);
+            }
             std::optional<std::string> explicit_id;
             if (payload.contains("id") && payload["id"].is_string() && !payload["id"].get<std::string>().empty()) {
                 explicit_id = payload["id"].get<std::string>();
@@ -621,7 +861,7 @@ nlohmann::json SimulationEngine::execute_command(const nlohmann::json& req) {
                 explicit_id
             );
             pm.sync_resource_keys(rm.resources());
-            append_event(state, "RESOURCE", "info", "Added resource facility " + res.id + " (" + res.name + " x" + std::to_string(res.total_instances) + ").");
+            append_event(state, "RESOURCE", "info", "Added resource facility " + res.id + " (" + res.name + " x" + std::to_string(res.total_instances) + ").", {{"resource_id", res.id}});
             refresh_diagnostics(state, pm, rm, true);
             return ok_response(cmd, state, {{"resource", SimulationSerializer::to_json(res)}});
         }
@@ -640,8 +880,9 @@ nlohmann::json SimulationEngine::execute_command(const nlohmann::json& req) {
             if (!rm.modify_resource(rid, new_total, new_preempt, err)) {
                 return err_response(cmd, "RESOURCE_ERROR", err, state);
             }
-            RecoveryManager::grant_satisfied_pending_requests(pm, rm);
-            append_event(state, "RESOURCE", "info", "Updated resource " + rid + ".");
+            auto unblocked = RecoveryManager::grant_satisfied_pending_requests(pm, rm);
+            state.granted_request_count += static_cast<int>(unblocked.size());
+            append_event(state, "RESOURCE", "info", "Updated resource " + rid + ".", {{"resource_id", rid}});
             refresh_diagnostics(state, pm, rm, true);
             return ok_response(cmd, state, {{"resource_id", rid}});
         }
@@ -657,7 +898,8 @@ nlohmann::json SimulationEngine::execute_command(const nlohmann::json& req) {
                 eval.error_code == "RESOURCE_NOT_FOUND" ||
                 eval.error_code == "INVALID_REQUEST" ||
                 eval.error_code == "REQUEST_EXCEEDS_NEED") {
-                append_event(state, "REJECTION", "error", eval.reason);
+                state.rejected_request_count += 1;
+                append_event(state, "REJECTION", "error", eval.reason, {{"process_id", pid}, {"reason_code", eval.error_code}});
                 return err_response(cmd, eval.error_code, eval.reason, state, {
                     {"granted", false},
                     {"waited", false},
@@ -672,7 +914,7 @@ nlohmann::json SimulationEngine::execute_command(const nlohmann::json& req) {
                     if (qty > 0) p->pending_request[rid] += qty;
                 }
                 p->state = ProcessState::BLOCKED;
-                append_event(state, "REQUEST", "warning", eval.reason);
+                append_event(state, "REQUEST", "warning", eval.reason, {{"process_id", pid}});
                 refresh_diagnostics(state, pm, rm, true);
                 return ok_response(cmd, state, {
                     {"granted", false},
@@ -684,7 +926,8 @@ nlohmann::json SimulationEngine::execute_command(const nlohmann::json& req) {
 
             if (!eval.approved) {
                 // Banker's Algorithm rejected unsafe request and rolled back
-                append_event(state, "REJECTION", "warning", eval.reason);
+                state.rejected_request_count += 1;
+                append_event(state, "REJECTION", "warning", eval.reason, {{"process_id", pid}, {"reason_code", "UNSAFE_STATE_REJECTED"}});
                 refresh_diagnostics(state, pm, rm, false);
                 return ok_response(cmd, state, {
                     {"granted", false},
@@ -697,8 +940,10 @@ nlohmann::json SimulationEngine::execute_command(const nlohmann::json& req) {
             // Grant allocation
             save_checkpoint(state);
             auto* p = pm.find_mut(pid);
+            std::string first_rid;
             for (const auto& [rid, qty] : req_vec) {
                 if (qty > 0) {
+                    if (first_rid.empty()) first_rid = rid;
                     std::string err;
                     rm.allocate(rid, qty, err);
                     p->allocated[rid] += qty;
@@ -708,7 +953,10 @@ nlohmann::json SimulationEngine::execute_command(const nlohmann::json& req) {
             if (p->state == ProcessState::BLOCKED || p->state == ProcessState::WAITING) {
                 p->state = ProcessState::READY;
             }
-            append_event(state, "ALLOCATION", "success", "Granted resource request for " + pid + ".");
+            state.granted_request_count += 1;
+            std::map<std::string, std::string> meta = {{"process_id", pid}};
+            if (!first_rid.empty()) meta["resource_id"] = first_rid;
+            append_event(state, "ALLOCATION", "success", "Granted resource request for " + pid + ".", meta);
             refresh_diagnostics(state, pm, rm, true);
             return ok_response(cmd, state, {
                 {"granted", true},
@@ -736,8 +984,10 @@ nlohmann::json SimulationEngine::execute_command(const nlohmann::json& req) {
                                         state);
                 }
             }
+            std::string first_rid;
             for (const auto& [rid, qty] : rel_vec) {
                 if (qty > 0) {
+                    if (first_rid.empty()) first_rid = rid;
                     std::string err;
                     rm.release(rid, qty, err);
                     p->allocated[rid] -= qty;
@@ -745,7 +995,10 @@ nlohmann::json SimulationEngine::execute_command(const nlohmann::json& req) {
             }
             pm.recompute_need(*p, rm.resources());
             auto unblocked = RecoveryManager::grant_satisfied_pending_requests(pm, rm);
-            append_event(state, "RELEASE", "info", "Process " + pid + " released resources.");
+            state.granted_request_count += static_cast<int>(unblocked.size());
+            std::map<std::string, std::string> meta = {{"process_id", pid}};
+            if (!first_rid.empty()) meta["resource_id"] = first_rid;
+            append_event(state, "RELEASE", "info", "Process " + pid + " released resources.", meta);
             refresh_diagnostics(state, pm, rm, true);
             return ok_response(cmd, state, {{"released", true}, {"unblocked_processes", unblocked}});
         }
@@ -791,7 +1044,16 @@ nlohmann::json SimulationEngine::execute_command(const nlohmann::json& req) {
             if (!rres.ok) {
                 return err_response(cmd, rres.error_code, rres.message, state, SimulationSerializer::to_json(rres));
             }
-            append_event(state, "RECOVERY", "success", rres.message);
+            std::map<std::string, std::string> meta = {{"strategy", to_string(rreq.strategy)}};
+            if (!rres.terminated_processes.empty()) meta["process_id"] = rres.terminated_processes.front();
+            if (!rres.preempted_resources.empty()) meta["resource_id"] = rres.preempted_resources.front();
+            append_event(
+                state,
+                rreq.strategy == RecoveryStrategy::ROLLBACK ? "ROLLBACK" : "RECOVERY",
+                "success",
+                rres.message,
+                meta
+            );
             refresh_diagnostics(state, pm, rm, true);
             return ok_response(cmd, state, SimulationSerializer::to_json(rres));
         }

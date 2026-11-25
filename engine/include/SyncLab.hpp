@@ -37,6 +37,11 @@ struct SyncEvent {
     std::string action;
     std::string resource;
     std::string detail;
+    int buffer_occupancy{-1};
+    int buffer_capacity{0};
+    int active_readers{0};
+    int active_writers{0};
+    std::vector<int> fork_owners;
 };
 
 struct SyncReport {
