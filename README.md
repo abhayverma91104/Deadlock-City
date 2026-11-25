@@ -128,6 +128,7 @@ Deadlock City/
 ├── docs/                       # Architecture, Algorithms, API, User Guide, Academic Report & Viva Guides
 ├── scripts/                    # Cross-platform setup.sh, dev.sh, and test.sh scripts
 ├── docker-compose.yml
+├── start.sh                    # One-command setup (if needed) and startup script
 ├── .dockerignore
 ├── .env.example
 └── README.md
@@ -163,23 +164,19 @@ Stop containers cleanly with:
 docker compose down
 ```
 
-### Option B: Native Setup & Development
+### Option B: One-Command Native Startup
 
-Copy environment defaults if customization is needed (optional):
+Run setup automatically (if not already built) and start both FastAPI (`127.0.0.1:8000`) and Vite (`127.0.0.1:5173`) in one go:
 
 ```bash
-cp .env.example .env
+./start.sh
 ```
 
-Install dependencies and compile the C++17 binary cleanly:
+Or run setup and dev servers separately:
 
 ```bash
+cp .env.example .env   # optional
 ./scripts/setup.sh
-```
-
-Start FastAPI (`127.0.0.1:8000`) + Vite dev server (`127.0.0.1:5173`):
-
-```bash
 ./scripts/dev.sh
 ```
 
@@ -294,7 +291,7 @@ Measured locally on Apple Silicon (macOS Darwin 25.5, 8 GB RAM host; Google Chro
 
 ---
 
-## 18. Documentation Index & Contributors
+## 18. Documentation Index & Owner
 
 - [docs/architecture.md](docs/architecture.md) — System architecture & Mermaid lifecycle diagrams
 - [docs/algorithms.md](docs/algorithms.md) — Formal algorithm specs, complexity, pseudocode, worked examples & test traceability
@@ -306,9 +303,6 @@ Measured locally on Apple Silicon (macOS Darwin 25.5, 8 GB RAM host; Google Chro
 - [docs/viva-guide.md](docs/viva-guide.md) — 60+ technical OS & architecture viva questions with grounded answers
 - [docs/portfolio.md](docs/portfolio.md) — Resume bullets, engineering highlights & interview summary
 
-### Contributors
+### Owner
 
-| Role | Contributor | Contact / ID |
-| :--- | :--- | :--- |
-| Author / Developer | `[Student / Developer Name Placeholder]` | `[Enrollment ID / GitHub Handle Placeholder]` |
-| Faculty Guide | `[Faculty Advisor Name Placeholder]` | `[Department of Computer Science & Engineering Placeholder]` |
+- **Abhay Verma**
